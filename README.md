@@ -21,9 +21,12 @@
 > **design targets/estimates that are not currently produced or validated by
 > code in this repository**, and some are internally inconsistent. See
 > [`LIMITATIONS.md`](LIMITATIONS.md) for a full, honest audit of what is and is
-> not substantiated. The one self-contained, reproducible, statistically
-> supported result today is the controlled prefetcher ablation in
-> [`experiments/prefetch_ablation.py`](experiments/prefetch_ablation.py).
+> not substantiated. The self-contained, reproducible results today are written
+> up in [`METHODOLOGY.md`](METHODOLOGY.md): a validated cycle model, a controlled
+> prefetcher ablation, a **multi-stream prefetcher** that fixes the single-stream
+> design's failure on interleaved streams, design-space sensitivity laws, and a
+> robustness analysis of the technology selection. Regenerate everything with
+> `bash scripts/reproduce_paper.sh`.
 
 ---
 
