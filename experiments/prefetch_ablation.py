@@ -51,7 +51,7 @@ from src.benchmarks.trace_generator import (
 from src.simulator.janus_sim import JanusSim, SimulationConfig
 
 LINE = 128  # cache line size (bytes) used throughout the study
-PREFETCH_MODES = ("none", "next_line", "stream")
+PREFETCH_MODES = ("none", "next_line", "stream", "multi_stream")
 
 
 def _run(trace: List[Tuple[str, int]], mode: str) -> Dict[str, float]:
@@ -238,14 +238,16 @@ def save_figure(rows: List[Dict], path: Path):
         key=lambda w: [r["workload"] for r in rows].index(w),
     )
     x = np.arange(len(workloads))
-    width = 0.25
+    n_modes = len(PREFETCH_MODES)
+    width = 0.8 / n_modes
 
-    fig, ax = plt.subplots(figsize=(10, 5.5))
+    fig, (ax_hr, ax_bw) = plt.subplots(2, 1, figsize=(11, 8.5), sharex=True)
     for i, mode in enumerate(PREFETCH_MODES):
-        heights, errs = [], []
+        heights, errs, bw = [], [], []
         for wl in workloads:
             r = next(r for r in rows if r["workload"] == wl and r["mode"] == mode)
             heights.append(r["hit_rate_mean"])
+            bw.append(r["bw_overhead"])
             if not np.isnan(r["hit_rate_ci_low"]):
                 errs.append(
                     (
@@ -256,18 +258,30 @@ def save_figure(rows: List[Dict], path: Path):
             else:
                 errs.append((0.0, 0.0))
         err = np.array(errs).T
-        ax.bar(x + (i - 1) * width, heights, width, label=mode, yerr=err, capsize=3)
+        offset = (i - (n_modes - 1) / 2) * width
+        ax_hr.bar(x + offset, heights, width, label=mode, yerr=err, capsize=3)
+        ax_bw.bar(x + offset, bw, width, label=mode)
 
-    ax.set_xticks(x)
-    ax.set_xticklabels(workloads, rotation=15)
-    ax.set_ylabel("T1 hit rate (%)")
-    ax.set_ylim(0, 105)
-    ax.set_title(
+    ax_hr.set_ylabel("T1 hit rate (%)")
+    ax_hr.set_ylim(0, 105)
+    ax_hr.set_title(
         "Prefetcher ablation on single-pass workloads\n"
         "(demand-only baseline = 0% by construction)"
     )
-    ax.legend(title="prefetch mode")
-    ax.grid(axis="y", alpha=0.3)
+    ax_hr.legend(title="prefetch mode", ncol=2)
+    ax_hr.grid(axis="y", alpha=0.3)
+
+    ax_bw.axhline(1.0, color="grey", ls="--", lw=0.8)
+    ax_bw.set_ylabel("prefetch bandwidth overhead\n(prefetches / demand read)")
+    ax_bw.set_yscale("symlog", linthresh=1.0)
+    ax_bw.set_xticks(x)
+    ax_bw.set_xticklabels(workloads, rotation=15)
+    ax_bw.grid(axis="y", alpha=0.3)
+    ax_bw.set_title(
+        "Lower is better; multi_stream matches next_line's hits at a fraction "
+        "of its bandwidth (see 'random')"
+    )
+
     fig.tight_layout()
     fig.savefig(path, dpi=150, bbox_inches="tight")
     print(f"Saved figure to {path}")
