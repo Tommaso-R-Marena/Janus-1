@@ -93,12 +93,27 @@ design targets at best, and removed or clearly labeled before publication:
 
 ## 6. What *is* defensible today
 
-The one self-contained, reproducible, statistically supported contribution is
-the **controlled prefetcher ablation** (`experiments/prefetch_ablation.py`): on
-single-pass workloads with a demand-only control, it quantifies where stream
-prefetching helps (unit-stride streams: 0% → ~100% at 1× bandwidth), where it is
-wasteful (next-line on random: 15× bandwidth for ~2% hit rate), and where the
-single-stream FSM fails (interleaved streams, non-unit strides).
+The self-contained, reproducible, statistically supported contributions are:
+
+* **The controlled prefetcher ablation** (`experiments/prefetch_ablation.py`):
+  on single-pass workloads with a demand-only control, it quantifies where
+  stream prefetching helps (unit-stride streams: 0% → ~100% at 1× bandwidth),
+  where it is wasteful (next-line on random: ~15× bandwidth for ~2% hit rate),
+  and where the single-stream FSM fails (interleaved streams, non-unit strides).
+* **A multi-stream prefetcher** (`prefetch_mode="multi_stream"`) that fixes the
+  interleaved-stream failure — ~99% hit rate on 8 streams (vs 0% for the single
+  FSM) while staying inert on sparse random access (unlike next-line). The
+  sweeps in `experiments/prefetch_sensitivity.py` establish two design laws: the
+  stream table must hold ≥ the number of concurrent streams, and look-ahead must
+  reach the T2 fill latency.
+* **Closed-form validation** of the cycle model
+  (`experiments/validate_simulator.py`, `tests/test_analytical_validation.py`).
+* **A robustness result for the technology selection**
+  (`experiments/power_robustness.py`): although the absolute power constants are
+  uncalibrated, eDRAM remains lower-power than HD-SRAM for the 224 MB
+  leakage-dominated cache with probability ~1.0 under ±50% constant uncertainty
+  (median 15.6× ratio). The *ordering* is trustworthy even though the absolute
+  watts are not.
 
 ## 7. Roadmap to a genuinely publishable result
 
