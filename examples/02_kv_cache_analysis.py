@@ -152,8 +152,9 @@ def main():
     
     print("\n✅ Analysis complete!")
     print("\nKey Takeaway:")
-    print("  INT4 quantization enables Llama-2 7B with 4K context to fit")
-    print("  in Janus-1's 256 MB on-chip memory hierarchy.")
+    print("  INT4 quantization cuts the KV-cache footprint 4x vs FP16, but")
+    print("  Llama-2 7B at 4K context is still ~512 MB in INT4 -- it exceeds a")
+    print("  256 MB on-chip budget. Shorter contexts (<=2K) do fit in INT4.")
     print()
 
 

@@ -118,6 +118,40 @@ class KVCacheSizer:
         print(f"\n{'='*70}\n")
 
 
+_BITS_TO_PRECISION = {32: "FP32", 16: "FP16", 8: "INT8", 4: "INT4"}
+
+
+def calculate_kv_cache_size(
+    num_layers: int,
+    hidden_dim: int,
+    context_length: int,
+    bits_per_param: int = 16,
+) -> float:
+    """Convenience wrapper returning KV-cache size in MB.
+
+    Args:
+        num_layers: Number of transformer layers.
+        hidden_dim: Model hidden dimension.
+        context_length: Context window length in tokens.
+        bits_per_param: Precision in bits (32, 16, 8 or 4).
+
+    Returns:
+        KV-cache size in megabytes.
+    """
+    if bits_per_param not in _BITS_TO_PRECISION:
+        raise ValueError(
+            f"bits_per_param must be one of {sorted(_BITS_TO_PRECISION)}, "
+            f"got {bits_per_param}"
+        )
+    config = ModelConfig(
+        num_layers=num_layers,
+        hidden_dim=hidden_dim,
+        context_length=context_length,
+    )
+    result = KVCacheSizer(config).calculate(_BITS_TO_PRECISION[bits_per_param])
+    return float(result["size_mb"])
+
+
 if __name__ == "__main__":
     # Example: Llama-2 7B cache analysis
     sizer = KVCacheSizer()
@@ -131,6 +165,4 @@ if __name__ == "__main__":
     print(
         f"  INT8 -> INT4 reduction: {int8_result['size_mb'] / int4_result['size_mb']:.1f}x"
     )
-    print(
-        f"  Memory saved: {int8_result['size_mb'] - int4_result['size_mb']:.1f} MB"
-    )
+    print(f"  Memory saved: {int8_result['size_mb'] - int4_result['size_mb']:.1f} MB")

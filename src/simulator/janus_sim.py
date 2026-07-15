@@ -26,6 +26,29 @@ class SimulationConfig:
     bank_conflict_penalty_cycles: int = 5
     prefetch_issue_width: int = 4
     prefetch_look_ahead: int = 16
+    # Prefetch policy:
+    #   "none"         - demand-only baseline (no prefetching)
+    #   "next_line"    - always prefetch the next lines
+    #   "stream"       - single unit-stride FSM stream detector
+    #   "multi_stream" - a small table of unit-stride stream detectors, so
+    #                    interleaved streams (e.g. per-layer KV reads) are each
+    #                    tracked independently.
+    # Exposing this as a first-class knob is what makes controlled ablations
+    # possible.
+    prefetch_mode: str = "stream"
+    # Number of concurrent streams tracked by the "multi_stream" detector.
+    prefetch_streams: int = 8
+
+    VALID_MODES = ("none", "next_line", "stream", "multi_stream")
+
+    def __post_init__(self):
+        if self.prefetch_mode not in self.VALID_MODES:
+            raise ValueError(
+                f"prefetch_mode must be one of {sorted(self.VALID_MODES)}, "
+                f"got {self.prefetch_mode!r}"
+            )
+        if self.prefetch_streams < 1:
+            raise ValueError("prefetch_streams must be >= 1")
 
 
 @dataclass
@@ -48,23 +71,17 @@ class SimulationMetrics:
     @property
     def p50_latency(self) -> float:
         """Calculate P50 (median) latency."""
-        return (
-            np.percentile(self.read_latencies, 50) if self.read_latencies else 0.0
-        )
+        return np.percentile(self.read_latencies, 50) if self.read_latencies else 0.0
 
     @property
     def p90_latency(self) -> float:
         """Calculate P90 latency."""
-        return (
-            np.percentile(self.read_latencies, 90) if self.read_latencies else 0.0
-        )
+        return np.percentile(self.read_latencies, 90) if self.read_latencies else 0.0
 
     @property
     def p99_latency(self) -> float:
         """Calculate P99 latency."""
-        return (
-            np.percentile(self.read_latencies, 99) if self.read_latencies else 0.0
-        )
+        return np.percentile(self.read_latencies, 99) if self.read_latencies else 0.0
 
 
 class JanusSim:
@@ -100,9 +117,7 @@ class JanusSim:
         """Initialize memory hierarchy state."""
         # T1 SRAM cache (LRU replacement)
         self.t1_sram_size_bytes = self.config.t1_sram_size_mb * 1024 * 1024
-        self.t1_max_lines = (
-            self.t1_sram_size_bytes // self.config.cache_line_size_bytes
-        )
+        self.t1_max_lines = self.t1_sram_size_bytes // self.config.cache_line_size_bytes
         self.t1_cache = collections.OrderedDict()
 
         # Bank busy tracking
@@ -119,8 +134,12 @@ class JanusSim:
 
     def _init_prefetcher(self):
         """Initialize prefetcher FSM state."""
+        # Single-stream detector state (used by "next_line" and "stream").
         self.prefetch_stream_addr = -1
         self.prefetch_stream_detected = False
+        # Multi-stream table: each entry is [last_addr, detected]. Ordered from
+        # least- to most-recently-used for cheap LRU replacement.
+        self.stream_table = []
 
     def _init_metrics(self):
         """Initialize performance metrics."""
@@ -144,6 +163,12 @@ class JanusSim:
     def run(self, trace: List[Tuple[str, int]]):
         """Run simulation on memory access trace.
 
+        Models an in-order core with a single outstanding demand miss: a demand
+        read that misses in T1 stalls the core until the line is filled from T2,
+        while the prefetch engine issues requests opportunistically. Each trace
+        entry is accounted for exactly once (a demand miss is counted as a miss
+        when issued and is *not* re-counted as a hit when the fill lands).
+
         Args:
             trace: List of (operation, address) tuples.
                   Operations: "READ" or "WRITE"
@@ -151,136 +176,190 @@ class JanusSim:
         trace_iterator = iter(trace)
         current_trace_entry = next(trace_iterator, None)
 
-        while current_trace_entry or self.pending_cpu_read or self.pending_events:
+        while (
+            current_trace_entry is not None
+            or self.pending_cpu_read is not None
+            or self.pending_events
+        ):
             self._process_pending_events()
-            self._process_pending_read(trace_iterator)
 
-            if not self.pending_cpu_read and current_trace_entry:
-                current_trace_entry = self._process_trace_entry(
-                    current_trace_entry, trace_iterator
-                )
+            # Complete an outstanding demand miss once its line has arrived,
+            # then advance past the entry that caused the miss. The core retires
+            # at most one access per cycle, so a new demand access is not issued
+            # in the same cycle a miss fill is consumed.
+            retired_this_cycle = False
+            if self.pending_cpu_read is not None:
+                if self._complete_pending_read():
+                    current_trace_entry = next(trace_iterator, None)
+                    retired_this_cycle = True
 
-            if self.prefetch_stream_detected:
-                self._issue_prefetches()
+            # Only issue a new demand access when the core is not stalled on a
+            # miss. A miss sets ``pending_cpu_read`` and holds the entry until
+            # the fill completes above (no re-processing => no double counting).
+            if (
+                not retired_this_cycle
+                and self.pending_cpu_read is None
+                and current_trace_entry is not None
+            ):
+                if self._handle_entry(current_trace_entry):
+                    current_trace_entry = next(trace_iterator, None)
+
+            self._maybe_issue_prefetches()
 
             self.cycle += 1
 
     def _process_pending_events(self):
-        """Process T2 responses arriving this cycle."""
-        arrivals = []
-        for addr, arrival_time, is_prefetch in self.pending_events:
-            if self.cycle >= arrival_time:
-                arrivals.append((addr, is_prefetch))
+        """Process T2 responses arriving this cycle (fills into T1)."""
+        arrived = [ev for ev in self.pending_events if self.cycle >= ev[1]]
+        if not arrived:
+            return
 
-        for addr, is_prefetch in arrivals:
+        self.pending_events = [ev for ev in self.pending_events if self.cycle < ev[1]]
+
+        for addr, _arrival_time, _is_prefetch in arrived:
             self.inflight_prefetches.discard(addr)
-
-            # Insert into T1 cache with LRU eviction
+            if addr in self.t1_cache:
+                continue
             if len(self.t1_cache) >= self.t1_max_lines:
                 self.t1_cache.popitem(last=False)
             self.t1_cache[addr] = True
 
-            # Remove from event queue
-            self.pending_events = [
-                ev for ev in self.pending_events if ev[0] != addr
-            ]
-
-    def _process_pending_read(self, trace_iterator):
-        """Complete pending CPU read if data now in T1."""
-        if not self.pending_cpu_read:
-            return
-
-        addr = self.pending_cpu_read
-        if addr in self.t1_cache:
-            bank_id = self.get_t1_bank(addr)
-            service_time = (
-                max(self.cycle, self.t1_bank_busy_until[bank_id])
-                + self.config.t1_latency_cycles
-            )
-
-            latency = service_time - self.pending_cpu_read_start_cycle
-            self.read_latencies.append(latency)
-
-            self.t1_bank_busy_until[bank_id] = service_time
-            self.t1_cache.move_to_end(addr)
-            self.pending_cpu_read = None
-
-    def _process_trace_entry(
-        self, entry: Tuple[str, int], trace_iterator
-    ) -> Optional[Tuple[str, int]]:
-        """Process a single trace entry.
+    def _complete_pending_read(self) -> bool:
+        """Complete the outstanding demand read if its line is now in T1.
 
         Returns:
-            Next trace entry to process, or None if entry is pending.
+            True if the read completed this cycle, False otherwise.
+        """
+        addr = self.pending_cpu_read
+        if addr not in self.t1_cache:
+            return False
+
+        bank_id = self.get_t1_bank(addr)
+        service_time = (
+            max(self.cycle, self.t1_bank_busy_until[bank_id])
+            + self.config.t1_latency_cycles
+        )
+        self.read_latencies.append(service_time - self.pending_cpu_read_start_cycle)
+        self.t1_bank_busy_until[bank_id] = service_time
+        self.t1_cache.move_to_end(addr)
+        self.pending_cpu_read = None
+        self.pending_cpu_read_start_cycle = None
+        return True
+
+    def _handle_entry(self, entry: Tuple[str, int]) -> bool:
+        """Handle a single trace entry.
+
+        Returns:
+            True if the trace should advance to the next entry (hit or write),
+            False if the core is now stalled on a demand miss.
         """
         op, addr = entry
 
         if op == "READ":
             self.compute_bw_count += 1
+            self._update_prefetch_state(addr)
 
             if addr in self.t1_cache:
-                # T1 hit
                 self.t1_hits += 1
                 bank_id = self.get_t1_bank(addr)
                 service_time = (
                     max(self.cycle, self.t1_bank_busy_until[bank_id])
                     + self.config.t1_latency_cycles
                 )
-
                 self.read_latencies.append(service_time - self.cycle)
                 self.t1_bank_busy_until[bank_id] = service_time
                 self.t1_cache.move_to_end(addr)
+                return True
 
-                next_entry = next(trace_iterator, None)
-            else:
-                # T1 miss - fetch from T2
-                self.t1_misses += 1
-                self.pending_cpu_read = addr
-                self.pending_cpu_read_start_cycle = self.cycle
-                self.issue_to_t2(addr, is_prefetch=False)
-                next_entry = entry  # Keep current entry
+            # T1 miss - stall the core and fetch from T2.
+            self.t1_misses += 1
+            self.pending_cpu_read = addr
+            self.pending_cpu_read_start_cycle = self.cycle
+            self.issue_to_t2(addr, is_prefetch=False)
+            return False
 
-            # Update prefetcher state
-            if (
-                self.prefetch_stream_addr + self.config.cache_line_size_bytes
-                == addr
-            ):
-                self.prefetch_stream_detected = True
-            else:
-                self.prefetch_stream_detected = False
-            self.prefetch_stream_addr = addr
-
-        elif op == "WRITE":
-            # Write allocates in T1
+        if op == "WRITE":
             if addr not in self.t1_cache:
                 if len(self.t1_cache) >= self.t1_max_lines:
                     self.t1_cache.popitem(last=False)
                 self.t1_cache[addr] = True
-            next_entry = next(trace_iterator, None)
+            return True
 
-        else:
-            raise ValueError(f"Unknown operation: {op}")
+        raise ValueError(f"Unknown operation: {op}")
 
-        return next_entry
+    def _update_prefetch_state(self, addr: int):
+        """Update the stream detector(s) on a demand read address."""
+        line = self.config.cache_line_size_bytes
 
-    def _issue_prefetches(self):
-        """Issue prefetches based on detected stream."""
+        # Single-stream FSM (used by "next_line" and "stream").
+        prev = self.prefetch_stream_addr
+        self.prefetch_stream_detected = prev >= 0 and prev + line == addr
+        self.prefetch_stream_addr = addr
+
+        # Multi-stream table (only maintained for "multi_stream").
+        if self.config.prefetch_mode == "multi_stream":
+            self._update_stream_table(addr, line)
+
+    def _update_stream_table(self, addr: int, line: int):
+        """Advance/allocate a per-stream entry for ``addr`` (LRU replacement)."""
+        for idx, entry in enumerate(self.stream_table):
+            last, _detected = entry
+            if last + line == addr:
+                # Stream continues: advance it and mark it confirmed.
+                self.stream_table.pop(idx)
+                self.stream_table.append([addr, True])
+                return
+            if last == addr:
+                # Repeat of the same line: refresh recency, no state change.
+                self.stream_table.pop(idx)
+                self.stream_table.append(entry)
+                return
+
+        # No matching stream: allocate a new (unconfirmed) candidate.
+        if len(self.stream_table) >= self.config.prefetch_streams:
+            self.stream_table.pop(0)
+        self.stream_table.append([addr, False])
+
+    def _active_anchors(self):
+        """Return the addresses the prefetcher should fetch ahead of."""
+        mode = self.config.prefetch_mode
+        if mode == "next_line":
+            return [self.prefetch_stream_addr] if self.prefetch_stream_addr >= 0 else []
+        if mode == "stream":
+            return [self.prefetch_stream_addr] if self.prefetch_stream_detected else []
+        if mode == "multi_stream":
+            return [last for last, detected in self.stream_table if detected]
+        return []
+
+    def _maybe_issue_prefetches(self):
+        """Issue prefetches for the active policy, if any."""
+        if self.config.prefetch_mode == "none":
+            return
+        self._issue_prefetches(self._active_anchors())
+
+    def _issue_prefetches(self, anchors):
+        """Issue up to ``prefetch_issue_width`` lines ahead of active anchors.
+
+        Prefetches are issued breadth-first over look-ahead distance so that
+        every active stream is advanced one line before any stream is advanced
+        two, keeping the shared issue bandwidth fair across streams.
+        """
+        if not anchors:
+            return
+        line = self.config.cache_line_size_bytes
         issued = 0
         for i in range(1, self.config.prefetch_look_ahead + 1):
-            if issued >= self.config.prefetch_issue_width:
-                break
-
-            pf_addr = (
-                self.prefetch_stream_addr + i * self.config.cache_line_size_bytes
-            )
-
-            if (
-                pf_addr not in self.t1_cache
-                and pf_addr not in self.inflight_prefetches
-            ):
-                self.issue_to_t2(pf_addr, is_prefetch=True)
-                self.inflight_prefetches.add(pf_addr)
-                issued += 1
+            for anchor in anchors:
+                if issued >= self.config.prefetch_issue_width:
+                    return
+                pf_addr = anchor + i * line
+                if (
+                    pf_addr not in self.t1_cache
+                    and pf_addr not in self.inflight_prefetches
+                ):
+                    self.issue_to_t2(pf_addr, is_prefetch=True)
+                    self.inflight_prefetches.add(pf_addr)
+                    issued += 1
 
     def issue_to_t2(self, addr: int, is_prefetch: bool):
         """Issue request to T2 eDRAM.
@@ -344,14 +423,43 @@ class JanusSim:
         print(f"\n{'='*60}\n")
 
 
-if __name__ == "__main__":
-    # Example usage
+def main(argv: Optional[List[str]] = None) -> int:
+    """Console entry point: run a demo simulation and print a report.
+
+    Usage:
+        janus-sim [context_length] [hidden_dim] [prefetch_mode]
+    """
+    import argparse
+
     from src.benchmarks.trace_generator import generate_llm_trace
 
-    print("Generating LLM inference trace...")
-    trace = generate_llm_trace(context_length=2048, hidden_dim=4096)
+    parser = argparse.ArgumentParser(
+        description="Run a Janus-1 memory-hierarchy simulation."
+    )
+    parser.add_argument("context_length", nargs="?", type=int, default=256)
+    parser.add_argument("hidden_dim", nargs="?", type=int, default=1024)
+    parser.add_argument(
+        "prefetch_mode",
+        nargs="?",
+        choices=["none", "next_line", "stream"],
+        default="stream",
+    )
+    args = parser.parse_args(argv)
 
-    print(f"Running simulation on {len(trace)} memory operations...")
-    sim = JanusSim()
+    print("Generating LLM inference trace...")
+    trace = generate_llm_trace(
+        context_length=args.context_length, hidden_dim=args.hidden_dim
+    )
+
+    print(
+        f"Running simulation on {len(trace):,} memory operations "
+        f"(prefetch_mode={args.prefetch_mode})..."
+    )
+    sim = JanusSim(SimulationConfig(prefetch_mode=args.prefetch_mode))
     sim.run(trace)
     sim.report()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
