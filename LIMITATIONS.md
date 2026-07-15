@@ -82,7 +82,14 @@ design targets at best, and removed or clearly labeled before publication:
   leakage in `memory_power_model.py` are plausible-order but **uncited**; they
   are not calibrated against CACTI/DRAMPower or a PDK.
 * **Workloads are synthetic.** Traces are generated analytically, not captured
-  from a real inference engine.
+  from a real inference engine. The shipped LLM KV trace also has ~0% line-level
+  spatial locality (each token's KV block is `hidden_dim·2` bytes apart), which
+  is why the unit-stride prefetcher is inert on it.
+* **Pure-Python throughput.** The cycle loop sustains ~1.3M memory-ops/s, so
+  multi-million-op traces take seconds to tens of seconds. Two tests document
+  these realities as `xfail` (spatial-locality expectation of the KV trace, and
+  a <5s runtime target for a 16.8M-op trace) rather than reshaping the workload
+  or weakening the assertion.
 
 ## 6. What *is* defensible today
 

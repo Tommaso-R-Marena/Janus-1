@@ -212,6 +212,7 @@ def _effect_sizes(seeds: int, accesses: int):
 
 
 def save_csv(rows: List[Dict], path: Path):
+    """Write the ablation rows to a CSV file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = list(rows[0].keys())
     with open(path, "w", newline="") as fh:
@@ -222,6 +223,7 @@ def save_csv(rows: List[Dict], path: Path):
 
 
 def save_figure(rows: List[Dict], path: Path):
+    """Render the hit-rate-by-workload bar chart to ``path``."""
     try:
         import matplotlib
 

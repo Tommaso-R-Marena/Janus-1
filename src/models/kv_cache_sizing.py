@@ -149,7 +149,7 @@ def calculate_kv_cache_size(
         context_length=context_length,
     )
     result = KVCacheSizer(config).calculate(_BITS_TO_PRECISION[bits_per_param])
-    return result["size_mb"]
+    return float(result["size_mb"])
 
 
 if __name__ == "__main__":
