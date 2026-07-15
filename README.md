@@ -14,6 +14,19 @@
 
 ---
 
+> ⚠️ **Status & reproducibility (please read):** This repository is a **Python
+> simulation and analytical-modeling study**, not a synthesized chip or silicon
+> measurement. The headline silicon-level metrics below (TOPS, watts, die area,
+> process node, perplexity, and the "99.99% hit rate from the prefetcher") are
+> **design targets/estimates that are not currently produced or validated by
+> code in this repository**, and some are internally inconsistent. See
+> [`LIMITATIONS.md`](LIMITATIONS.md) for a full, honest audit of what is and is
+> not substantiated. The one self-contained, reproducible, statistically
+> supported result today is the controlled prefetcher ablation in
+> [`experiments/prefetch_ablation.py`](experiments/prefetch_ablation.py).
+
+---
+
 ## 🎯 Overview
 
 Janus-1 is a specialized processor architecture designed to overcome the "memory wall" challenge in deploying large language models at the edge. Through a holistic co-design methodology combining algorithmic optimization, heterogeneous memory architecture, and intelligent prefetching, Janus-1 achieves:
