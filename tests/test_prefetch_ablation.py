@@ -23,8 +23,12 @@ from src.benchmarks.trace_generator import (
 LINE = 128
 
 
-def _hit_rate(trace, mode):
-    sim = JanusSim(SimulationConfig(cache_line_size_bytes=LINE, prefetch_mode=mode))
+def _hit_rate(trace, mode, streams=8):
+    sim = JanusSim(
+        SimulationConfig(
+            cache_line_size_bytes=LINE, prefetch_mode=mode, prefetch_streams=streams
+        )
+    )
     sim.run(trace)
     return sim.get_metrics().hit_rate
 
@@ -71,6 +75,37 @@ def test_prefetch_does_not_help_sparse_random():
         seed=0,
     )
     assert _hit_rate(trace, "stream") == pytest.approx(_hit_rate(trace, "none"))
+
+
+def test_multi_stream_recovers_interleaved_streams():
+    """The multi-stream table tracks the 8 streams the single FSM cannot."""
+    trace = generate_streaming_trace(num_streams=8, stream_length=250, stride=LINE)
+    assert _hit_rate(trace, "stream") < 5.0
+    assert _hit_rate(trace, "multi_stream", streams=8) > 95.0
+
+
+def test_multi_stream_needs_table_at_least_num_streams():
+    """A table smaller than the concurrent-stream count cannot confirm any."""
+    trace = generate_streaming_trace(num_streams=8, stream_length=250, stride=LINE)
+    assert _hit_rate(trace, "multi_stream", streams=4) < 5.0
+    assert _hit_rate(trace, "multi_stream", streams=8) > 95.0
+
+
+def test_multi_stream_no_regression_on_single_stream():
+    """Multi-stream must match single-stream on a lone unit-stride stream."""
+    trace = generate_sequential_trace(num_accesses=2000, stride=LINE)
+    assert _hit_rate(trace, "multi_stream") > 99.0
+
+
+def test_multi_stream_inert_on_sparse_random():
+    """Multi-stream must not waste bandwidth chasing sparse random access."""
+    trace = generate_random_trace(
+        num_accesses=2000,
+        addr_range=(0, 2000 * LINE * 512),
+        alignment=LINE,
+        seed=0,
+    )
+    assert _hit_rate(trace, "multi_stream") == pytest.approx(_hit_rate(trace, "none"))
 
 
 if __name__ == "__main__":

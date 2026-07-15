@@ -26,18 +26,29 @@ class SimulationConfig:
     bank_conflict_penalty_cycles: int = 5
     prefetch_issue_width: int = 4
     prefetch_look_ahead: int = 16
-    # Prefetch policy: "none" (demand-only baseline), "next_line" (always
-    # prefetch the next lines), or "stream" (FSM stream detector). Exposing
-    # this as a first-class knob is what makes controlled ablations possible.
+    # Prefetch policy:
+    #   "none"         - demand-only baseline (no prefetching)
+    #   "next_line"    - always prefetch the next lines
+    #   "stream"       - single unit-stride FSM stream detector
+    #   "multi_stream" - a small table of unit-stride stream detectors, so
+    #                    interleaved streams (e.g. per-layer KV reads) are each
+    #                    tracked independently.
+    # Exposing this as a first-class knob is what makes controlled ablations
+    # possible.
     prefetch_mode: str = "stream"
+    # Number of concurrent streams tracked by the "multi_stream" detector.
+    prefetch_streams: int = 8
+
+    VALID_MODES = ("none", "next_line", "stream", "multi_stream")
 
     def __post_init__(self):
-        valid_modes = {"none", "next_line", "stream"}
-        if self.prefetch_mode not in valid_modes:
+        if self.prefetch_mode not in self.VALID_MODES:
             raise ValueError(
-                f"prefetch_mode must be one of {sorted(valid_modes)}, "
+                f"prefetch_mode must be one of {sorted(self.VALID_MODES)}, "
                 f"got {self.prefetch_mode!r}"
             )
+        if self.prefetch_streams < 1:
+            raise ValueError("prefetch_streams must be >= 1")
 
 
 @dataclass
@@ -123,8 +134,12 @@ class JanusSim:
 
     def _init_prefetcher(self):
         """Initialize prefetcher FSM state."""
+        # Single-stream detector state (used by "next_line" and "stream").
         self.prefetch_stream_addr = -1
         self.prefetch_stream_detected = False
+        # Multi-stream table: each entry is [last_addr, detected]. Ordered from
+        # least- to most-recently-used for cheap LRU replacement.
+        self.stream_table = []
 
     def _init_metrics(self):
         """Initialize performance metrics."""
@@ -273,36 +288,78 @@ class JanusSim:
         raise ValueError(f"Unknown operation: {op}")
 
     def _update_prefetch_state(self, addr: int):
-        """Update the stream detector on a demand read address."""
+        """Update the stream detector(s) on a demand read address."""
+        line = self.config.cache_line_size_bytes
+
+        # Single-stream FSM (used by "next_line" and "stream").
         prev = self.prefetch_stream_addr
-        self.prefetch_stream_detected = (
-            prev >= 0 and prev + self.config.cache_line_size_bytes == addr
-        )
+        self.prefetch_stream_detected = prev >= 0 and prev + line == addr
         self.prefetch_stream_addr = addr
+
+        # Multi-stream table (only maintained for "multi_stream").
+        if self.config.prefetch_mode == "multi_stream":
+            self._update_stream_table(addr, line)
+
+    def _update_stream_table(self, addr: int, line: int):
+        """Advance/allocate a per-stream entry for ``addr`` (LRU replacement)."""
+        for idx, entry in enumerate(self.stream_table):
+            last, _detected = entry
+            if last + line == addr:
+                # Stream continues: advance it and mark it confirmed.
+                self.stream_table.pop(idx)
+                self.stream_table.append([addr, True])
+                return
+            if last == addr:
+                # Repeat of the same line: refresh recency, no state change.
+                self.stream_table.pop(idx)
+                self.stream_table.append(entry)
+                return
+
+        # No matching stream: allocate a new (unconfirmed) candidate.
+        if len(self.stream_table) >= self.config.prefetch_streams:
+            self.stream_table.pop(0)
+        self.stream_table.append([addr, False])
+
+    def _active_anchors(self):
+        """Return the addresses the prefetcher should fetch ahead of."""
+        mode = self.config.prefetch_mode
+        if mode == "next_line":
+            return [self.prefetch_stream_addr] if self.prefetch_stream_addr >= 0 else []
+        if mode == "stream":
+            return [self.prefetch_stream_addr] if self.prefetch_stream_detected else []
+        if mode == "multi_stream":
+            return [last for last, detected in self.stream_table if detected]
+        return []
 
     def _maybe_issue_prefetches(self):
         """Issue prefetches for the active policy, if any."""
-        mode = self.config.prefetch_mode
-        if mode == "none" or self.prefetch_stream_addr < 0:
+        if self.config.prefetch_mode == "none":
             return
-        # "next_line" prefetches unconditionally; "stream" waits until the FSM
-        # has observed a run of consecutive cache lines.
-        if mode == "next_line" or self.prefetch_stream_detected:
-            self._issue_prefetches()
+        self._issue_prefetches(self._active_anchors())
 
-    def _issue_prefetches(self):
-        """Issue up to ``prefetch_issue_width`` lines ahead of the stream."""
+    def _issue_prefetches(self, anchors):
+        """Issue up to ``prefetch_issue_width`` lines ahead of active anchors.
+
+        Prefetches are issued breadth-first over look-ahead distance so that
+        every active stream is advanced one line before any stream is advanced
+        two, keeping the shared issue bandwidth fair across streams.
+        """
+        if not anchors:
+            return
+        line = self.config.cache_line_size_bytes
         issued = 0
         for i in range(1, self.config.prefetch_look_ahead + 1):
-            if issued >= self.config.prefetch_issue_width:
-                break
-
-            pf_addr = self.prefetch_stream_addr + i * self.config.cache_line_size_bytes
-
-            if pf_addr not in self.t1_cache and pf_addr not in self.inflight_prefetches:
-                self.issue_to_t2(pf_addr, is_prefetch=True)
-                self.inflight_prefetches.add(pf_addr)
-                issued += 1
+            for anchor in anchors:
+                if issued >= self.config.prefetch_issue_width:
+                    return
+                pf_addr = anchor + i * line
+                if (
+                    pf_addr not in self.t1_cache
+                    and pf_addr not in self.inflight_prefetches
+                ):
+                    self.issue_to_t2(pf_addr, is_prefetch=True)
+                    self.inflight_prefetches.add(pf_addr)
+                    issued += 1
 
     def issue_to_t2(self, addr: int, is_prefetch: bool):
         """Issue request to T2 eDRAM.
