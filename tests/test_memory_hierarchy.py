@@ -35,8 +35,9 @@ class TestMemoryHierarchyCorrectness:
 
     def test_t1_lru_eviction(self):
         """Test LRU eviction policy in T1 SRAM."""
-        # Configure small T1 cache (only 1 MB = 8192 lines)
-        config = SimulationConfig(t1_sram_size_mb=1)
+        # Configure small T1 cache (only 1 MB = 8192 lines). Disable the
+        # prefetcher so this test isolates pure demand-driven LRU behaviour.
+        config = SimulationConfig(t1_sram_size_mb=1, prefetch_mode="none")
         sim = JanusSim(config)
         
         # Fill cache to capacity + 1
@@ -60,10 +61,10 @@ class TestMemoryHierarchyCorrectness:
         metrics = sim.get_metrics()
         
         # First fill: all misses (num_lines)
-        # Second access to 0: hit
-        # New address: miss (evicts something)
-        # Third access to 0: miss (was evicted)
-        expected_hits = 1
+        # Second access to 0: hit -> promotes line 0 to most-recently-used
+        # New address: miss -> evicts the true LRU line (line 1), NOT line 0
+        # Third access to 0: hit (line 0 was promoted, so it survives)
+        expected_hits = 2
         assert metrics.t1_hits == expected_hits, f"Expected {expected_hits} hits, got {metrics.t1_hits}"
 
     def test_bank_conflict_detection(self):
@@ -245,7 +246,8 @@ class TestStressScenarios:
 
     def test_capacity_miss_behavior(self):
         """Test behavior when working set exceeds T1 capacity."""
-        config = SimulationConfig(t1_sram_size_mb=1)  # Small cache
+        # Small cache; disable prefetch to isolate capacity-miss behaviour.
+        config = SimulationConfig(t1_sram_size_mb=1, prefetch_mode="none")
         sim = JanusSim(config)
         
         # Working set larger than cache
@@ -343,7 +345,11 @@ class TestConfigurationVariations:
     def test_varying_line_sizes(self):
         """Test different cache line sizes."""
         for line_size in [64, 128, 256]:
-            config = SimulationConfig(cache_line_size_bytes=line_size)
+            # Disable prefetch: this test checks that every unique first-touch
+            # line misses, which a stream prefetcher would otherwise hide.
+            config = SimulationConfig(
+                cache_line_size_bytes=line_size, prefetch_mode="none"
+            )
             sim = JanusSim(config)
             
             trace = [("READ", i * line_size) for i in range(100)]

@@ -169,15 +169,23 @@ class JanusSim:
             self._process_pending_events()
 
             # Complete an outstanding demand miss once its line has arrived,
-            # then advance past the entry that caused the miss.
+            # then advance past the entry that caused the miss. The core retires
+            # at most one access per cycle, so a new demand access is not issued
+            # in the same cycle a miss fill is consumed.
+            retired_this_cycle = False
             if self.pending_cpu_read is not None:
                 if self._complete_pending_read():
                     current_trace_entry = next(trace_iterator, None)
+                    retired_this_cycle = True
 
             # Only issue a new demand access when the core is not stalled on a
             # miss. A miss sets ``pending_cpu_read`` and holds the entry until
             # the fill completes above (no re-processing => no double counting).
-            if self.pending_cpu_read is None and current_trace_entry is not None:
+            if (
+                not retired_this_cycle
+                and self.pending_cpu_read is None
+                and current_trace_entry is not None
+            ):
                 if self._handle_entry(current_trace_entry):
                     current_trace_entry = next(trace_iterator, None)
 
